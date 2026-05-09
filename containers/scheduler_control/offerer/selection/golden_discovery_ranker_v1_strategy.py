@@ -52,6 +52,8 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
         WITH eligible_domains AS (
             SELECT
                 domain_id,
+                MAX(CASE WHEN is_selectdb_selected THEN 1 ELSE 0 END) AS has_selectdb_selected,
+                MAX(CASE WHEN is_selectdb_selected THEN selectdb_score END) AS best_selectdb_score,
                 MAX(CASE WHEN url_score_updated_at IS NOT NULL THEN url_score END) AS best_golden_discovery_score,
                 MAX(url_score) AS best_any_score,
                 MAX(domain_score) AS best_domain_score,
@@ -66,6 +68,8 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
               )
             GROUP BY domain_id
             ORDER BY
+                has_selectdb_selected DESC,
+                best_selectdb_score DESC NULLS LAST,
                 best_golden_discovery_score DESC NULLS LAST,
                 best_any_score DESC NULLS LAST,
                 best_domain_score DESC NULLS LAST,
@@ -81,6 +85,8 @@ class GoldenDiscoveryRankerV1Strategy(SelectionStrategy):
                 FROM {table}
                 WHERE should_crawl = TRUE AND domain_id = d.domain_id
                 ORDER BY
+                    CASE WHEN is_selectdb_selected THEN 0 ELSE 1 END,
+                    selectdb_score DESC NULLS LAST,
                     CASE WHEN url_score_updated_at IS NULL THEN 1 ELSE 0 END,
                     url_score DESC NULLS LAST,
                     domain_score DESC NULLS LAST,

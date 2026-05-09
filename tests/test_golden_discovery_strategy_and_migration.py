@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,7 +16,9 @@ from containers.scheduler_control.scorer.service import (
 )
 from containers.scheduler_ingest.ingestor import db_ops as ingest_db_ops
 from containers.scheduler_ingest.ingestor.db_ops import IngestDB
+from containers.scheduler_ingest.ingestor.selectdb_results import SelectDBCrawlResultWriter
 from scripts import migrate_add_url_score_updated_at as migration
+from scripts import migrate_add_selectdb_integration as selectdb_migration
 
 
 class GoldenDiscoveryMigrationSqlTest(unittest.TestCase):
@@ -74,6 +78,30 @@ class GoldenDiscoveryMigrationSqlTest(unittest.TestCase):
             "ADD COLUMN IF NOT EXISTS url_score_updated_at TIMESTAMPTZ",
         )
 
+    def test_selectdb_integration_migration_adds_priority_columns(self):
+        sql = selectdb_migration.add_selectdb_column_sql(
+            "url_state_current_003",
+            "is_selectdb_selected",
+            "BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+        self.assertEqual(
+            sql,
+            "ALTER TABLE url_state_current_003 "
+            "ADD COLUMN IF NOT EXISTS is_selectdb_selected BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+
+        index_sql = selectdb_migration.create_selectdb_priority_index_sql(3)
+        self.assertIn("idx_url_state_current_003_selectdb_priority", index_sql)
+        self.assertIn("is_selectdb_selected DESC", index_sql)
+        self.assertIn("selectdb_score DESC NULLS LAST", index_sql)
+        self.assertIn("WHERE should_crawl = TRUE", index_sql)
+
+    def test_selectdb_result_schema_has_html_path(self):
+        schema_sql = selectdb_migration.SELECTDB_RESULT_SCHEMA_SQL
+        self.assertIn("public.selected_url_crawl_results", schema_sql)
+        self.assertIn("html_path TEXT", schema_sql)
+        self.assertIn("crawl_synced_at TIMESTAMPTZ", schema_sql)
+
 
 class _FakeResult:
     def fetchall(self):
@@ -128,10 +156,16 @@ class GoldenDiscoveryOffererStrategyTest(unittest.TestCase):
             "MAX(CASE WHEN url_score_updated_at IS NOT NULL THEN url_score END)",
             sql,
         )
+        self.assertIn("MAX(CASE WHEN is_selectdb_selected THEN 1 ELSE 0 END)", sql)
+        self.assertIn("MAX(CASE WHEN is_selectdb_selected THEN selectdb_score END)", sql)
+        self.assertIn("has_selectdb_selected DESC", sql)
+        self.assertIn("best_selectdb_score DESC NULLS LAST", sql)
         self.assertNotIn("WHEN MAX(CASE", sql)
         self.assertIn("NOT EXISTS", sql)
         self.assertIn("FROM domain_state d", sql)
         self.assertIn("d.crawl_paused_until > NOW()", sql)
+        self.assertIn("CASE WHEN is_selectdb_selected THEN 0 ELSE 1 END", sql)
+        self.assertIn("selectdb_score DESC NULLS LAST", sql)
         self.assertIn(
             "CASE WHEN url_score_updated_at IS NULL THEN 1 ELSE 0 END",
             sql,
@@ -345,6 +379,49 @@ class GoldenDiscoveryIngestInlineScoringTest(unittest.TestCase):
         current_rows = execute_values_calls[0][1]
         self.assertEqual(current_rows[0][3], 0.0)
         self.assertIsNone(current_rows[0][4])
+
+
+class SelectDBCrawlResultWriterTest(unittest.TestCase):
+    def test_html_writer_stores_successful_html_by_path(self):
+        with TemporaryDirectory() as tmp:
+            writer = object.__new__(SelectDBCrawlResultWriter)
+            writer.html_dir = Path(tmp)
+            path = writer._write_html(
+                url="https://example.com/a",
+                content="<html>ok</html>",
+                fetched_at="2026-05-09T01:02:03+00:00",
+                shard_id=5,
+                status="ok",
+            )
+
+            self.assertIsNotNone(path)
+            html_path = Path(path)
+            self.assertTrue(html_path.is_file())
+            self.assertIn("20260509", str(html_path))
+            self.assertIn("shard_005", str(html_path))
+            self.assertEqual(html_path.read_text(encoding="utf-8"), "<html>ok</html>")
+
+    def test_html_writer_does_not_write_failures(self):
+        with TemporaryDirectory() as tmp:
+            writer = object.__new__(SelectDBCrawlResultWriter)
+            writer.html_dir = Path(tmp)
+            path = writer._write_html(
+                url="https://example.com/a",
+                content="<html>fail</html>",
+                fetched_at="2026-05-09T01:02:03+00:00",
+                shard_id=5,
+                status="fail",
+            )
+            self.assertIsNone(path)
+            self.assertEqual(list(Path(tmp).glob("**/*")), [])
+
+    def test_upsert_keeps_previous_html_path_when_excluded_path_is_null(self):
+        sql = SelectDBCrawlResultWriter._upsert_sql()
+        self.assertIn("public.selected_url_crawl_results", sql)
+        self.assertIn(
+            "html_path = COALESCE(EXCLUDED.html_path, selected_url_crawl_results.html_path)",
+            sql,
+        )
 
 
 if __name__ == "__main__":

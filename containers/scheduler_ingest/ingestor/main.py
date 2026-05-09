@@ -16,6 +16,7 @@ from libs.stats.delta_writer import StatsDeltaWriter
 
 from .service import IngestService
 from .db_ops import IngestDB
+from .selectdb_results import SelectDBCrawlResultWriter
 
 
 LOGGER = logging.getLogger("ingestor")
@@ -76,6 +77,7 @@ def main():
 
     ingestor = require(raw, "ingestor")
     pg = require(raw, "postgres")
+    selectdb_raw: dict[str, Any] = dict(raw.get("selectdb") or {})
 
     prog = Progress(require(ingestor, "progress_template").format(id=ingestor_id))
     interval_minutes = int(ingestor.get("interval_minutes", 30))
@@ -102,7 +104,49 @@ def main():
     )
     Session = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    db = IngestDB(Session, inline_ranker=_load_inline_ranker(raw))
+    selectdb_writer = None
+    selectdb_enabled = _env_bool(
+        "SELECTDB_CRAWL_RESULTS_ENABLED",
+        bool(selectdb_raw.get("enabled", False)),
+    )
+    if selectdb_enabled:
+        selectdb_dsn = _env_str("SELECTDB_DSN", str(require(selectdb_raw, "dsn")))
+        html_dir = _env_str(
+            "SELECTDB_HTML_DIR",
+            str(selectdb_raw.get("html_dir", "/data/ipc/html/selectdb")),
+        )
+        select_engine = create_engine(
+            selectdb_dsn,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            pool_size=1,
+            max_overflow=1,
+            pool_timeout=30,
+            future=True,
+            connect_args={
+                "keepalives": 1,
+                "keepalives_idle": 30,
+                "keepalives_interval": 5,
+                "keepalives_count": 5,
+            },
+        )
+        SelectSession = sessionmaker(
+            bind=select_engine,
+            autoflush=False,
+            autocommit=False,
+            future=True,
+        )
+        selectdb_writer = SelectDBCrawlResultWriter(
+            SelectSession,
+            html_dir=html_dir,
+            ensure_schema=_env_bool("SELECTDB_CRAWL_RESULTS_ENSURE_SCHEMA", True),
+        )
+
+    db = IngestDB(
+        Session,
+        inline_ranker=_load_inline_ranker(raw),
+        selectdb_writer=selectdb_writer,
+    )
     stats_dir=require(ingestor, "stats_dir")
     svc = IngestService(ingestor_id, db, StatsDeltaWriter(stats_dir))
 

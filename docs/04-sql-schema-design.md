@@ -125,6 +125,7 @@ Key columns:
 - rolling counters: `num_scheduled_90d`, `num_fetch_ok_90d`, `num_fetch_fail_90d`, `num_content_update_90d`
 - quality/failure: `num_consecutive_fail`, `last_fail_reason`, `content_hash`
 - scheduling flags/signals: `should_crawl`, `url_score`, `url_score_updated_at`, `domain_score`
+- selectdb integration: `is_selectdb_selected`, `selectdb_score`, `selectdb_run_id`, `selectdb_selected_at`, `selectdb_synced_at`
 - link signals: `inlink_count_approx INTEGER NOT NULL DEFAULT 0`, `inlink_count_external INTEGER NOT NULL DEFAULT 0` (non-deduplicated observed outlink counters from crawler discovery; no historical backfill)
 - provenance: `source SMALLINT NOT NULL DEFAULT 0` (`0` = natural discovery, `1` = golden set membership; see `scripts/golden_inject.py`)
 - provenance: `discovered_from VARCHAR` (parent page URL on first discovery; NULL for golden-injected and seed URLs; first parent wins via `ON CONFLICT DO NOTHING`)
@@ -136,7 +137,8 @@ Key columns:
 
 Write patterns:
 
-- Offerer: selects `should_crawl=TRUE`, then updates scheduling fields.
+- Offerer: selects `should_crawl=TRUE`, prioritizing selectdb-selected URLs when present, then updates scheduling fields.
+- IndexSelection notification: mirrors `selectdb.public.selected_urls_current` into current-table selectdb fields; new `run_id` matches are reopened with `should_crawl=TRUE`.
 - Ingestor: upserts fetch outcomes and resets/extends failure counters.
 - Router-discovered links: inserted with initial `domain_score`.
 - Golden set injection (`scripts/golden_inject.py`): inserts new URLs with `source=1`, or upserts `source=1` onto existing rows so that golden set membership is identifiable even when the crawler discovered the URL naturally first.
@@ -241,6 +243,7 @@ To support current query patterns efficiently, maintain indexes such as:
 - `url_state_current_{shard}(should_crawl, last_scheduled, url_score, domain_score)`
 - `url_state_current_{shard}(first_seen ASC NULLS LAST) WHERE should_crawl = TRUE AND url_score_updated_at IS NULL` for Golden Discovery Ranker v1 unscored-row batches; URL text is intentionally left out of the index key to reduce write churn.
 - `url_state_current_{shard}(domain_id, score-refresh flag, url_score DESC, domain_score DESC, last_scheduled ASC, first_seen ASC) WHERE should_crawl = TRUE` for Golden Discovery Ranker v1 per-domain selection.
+- `url_state_current_{shard}(is_selectdb_selected DESC, selectdb_score DESC NULLS LAST, domain_id, last_scheduled ASC NULLS FIRST, first_seen ASC) WHERE should_crawl = TRUE` for selectdb-selected URL priority scheduling.
 - `url_state_current_{shard}(domain_id)`
 - `domain_stats_daily(event_date)`
 - `summary_daily(event_date)` primary key (already)

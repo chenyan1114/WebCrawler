@@ -89,7 +89,19 @@ Recommended rollout order:
 6. Mount the ranker artifact, then enable `GOLDEN_DISCOVERY_RANKER_V1_ENABLED=true`.
 7. After ranker progress is visible through increasing non-NULL `url_score_updated_at` rows, switch `OFFERER_STRATEGY=golden_discovery_ranker_v1`.
 
-## 6.6 `migrate_add_url_metadata.py`
+## 6.6 `migrate_add_selectdb_integration.py`
+
+- One-time migration before enabling IndexSelection notifications for selectdb URL scheduling.
+- Adds selectdb mirror fields to all 256 `url_state_current_{shard}` tables.
+- Creates `idx_url_state_current_{shard}_selectdb_priority` partial indexes for selected URL priority scheduling.
+- Creates `selectdb.public.selected_url_crawl_results`, which stores the latest selected URL crawlerdb state snapshot plus `html_path`.
+
+```bash
+python scripts/migrate_add_selectdb_integration.py --dry-run
+python scripts/migrate_add_selectdb_integration.py
+```
+
+## 6.7 `migrate_add_url_metadata.py`
 
 - One-time migration.
 - Adds lightweight discovery and response metadata columns to all 256 shards of `url_state_current_{shard}` and `url_state_history_{shard}` (6144 ALTERs total).
@@ -106,7 +118,7 @@ Recommended rollout order:
 uv run scripts/migrate_add_url_metadata.py [--dry-run]
 ```
 
-## 6.7 `migrate_add_has_json_ld.py`
+## 6.8 `migrate_add_has_json_ld.py`
 
 - One-time migration.
 - Adds `has_json_ld BOOLEAN` (nullable, no default) to all 256 shards of `url_state_current_{shard}` and `url_state_history_{shard}` (512 ALTERs total).
@@ -118,7 +130,7 @@ uv run scripts/migrate_add_url_metadata.py [--dry-run]
 uv run scripts/migrate_add_has_json_ld.py [--dry-run]
 ```
 
-## 6.8 `migrate_merge_subdomain_rows.py`
+## 6.9 `migrate_merge_subdomain_rows.py`
 
 - One-time migration.
 - Cleans up legacy `domain_state` rows in subdomain form (e.g. `en.wikipedia.org`) left by an older `golden_inject` that used `urlparse().hostname` instead of eTLD+1.
@@ -131,7 +143,7 @@ uv run scripts/migrate_merge_subdomain_rows.py --dry-run
 uv run scripts/migrate_merge_subdomain_rows.py --execute
 ```
 
-## 6.9 `migrate_shard_split.py`
+## 6.10 `migrate_shard_split.py`
 
 - Recurring / on-demand.
 - For each eTLD+1 listed in `containers/scheduler_ingest/config/shard_split.yaml`, moves `url_state_current_{old}`, `url_state_history_{old}`, and `url_event_counter_{old}` rows to new per-hostname shards (`md5(hostname) % 256`). `domain_state` is upserted per hostname with the new `shard_id`.
@@ -144,7 +156,7 @@ uv run scripts/migrate_shard_split.py             # dry-run
 uv run scripts/migrate_shard_split.py --execute   # actually move rows
 ```
 
-## 6.10 `migrate_add_domain_pause.py`
+## 6.11 `migrate_add_domain_pause.py`
 
 - One-time migration.
 - Adds `crawl_paused_until TIMESTAMPTZ` and `domain_fail_count INT NOT NULL DEFAULT 0` to `domain_state`.
@@ -155,7 +167,7 @@ uv run scripts/migrate_shard_split.py --execute   # actually move rows
 uv run scripts/migrate_add_domain_pause.py [--dry-run]
 ```
 
-## 6.11 `constants.py`
+## 6.12 `constants.py`
 
 Shared constants:
 

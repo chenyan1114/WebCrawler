@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,14 @@ from psycopg2.extras import execute_values
 from sqlalchemy.orm import sessionmaker
 
 from libs.scoring.golden_discovery_runtime import GoldenDiscoveryRuntimeScorer
+from .selectdb_results import (
+    CRAWL_RESULT_COLUMNS,
+    SelectDBCrawlRecord,
+    SelectDBCrawlResultWriter,
+)
+
+
+logger = logging.getLogger("ingestor.db_ops")
 
 
 @dataclass
@@ -114,15 +123,25 @@ _HIST_COLS = (
     "robots_bits",
 )
 
+_SELECTDB_MARKER_COLS = (
+    "is_selectdb_selected",
+    "selectdb_score",
+    "selectdb_run_id",
+    "selectdb_selected_at",
+    "selectdb_synced_at",
+)
+
 
 class IngestDB:
     def __init__(
         self,
         Session: sessionmaker,
         inline_ranker: GoldenDiscoveryRuntimeScorer | None = None,
+        selectdb_writer: SelectDBCrawlResultWriter | None = None,
     ):
         self.Session = Session
         self.inline_ranker = inline_ranker
+        self.selectdb_writer = selectdb_writer
 
     def _tcur(self, shard_id: int) -> str:
         return f"url_state_current_{shard_id:03d}"
@@ -192,7 +211,11 @@ class IngestDB:
         return sub_batches
 
     def _bulk_results_unique(
-        self, cur, shard_id: int, items: list[tuple[int, dict]],
+        self,
+        cur,
+        shard_id: int,
+        items: list[tuple[int, dict]],
+        selectdb_records: list[SelectDBCrawlRecord] | None = None,
     ) -> list[tuple[int, IngestResult]]:
         """Process one sub-batch of crawl results (unique URLs) for a shard."""
         if not items:
@@ -236,6 +259,9 @@ class IngestDB:
                 "is_redirect": rec.get("is_redirect"),
                 "redirect_hop_count": rec.get("redirect_hop_count"),
                 "robots_bits": self._robots_bits(is_ok, rec.get("fail_reason")),
+                "status": rec.get("status"),
+                "fetched_at_raw": rec.get("fetched_at"),
+                "content": rec.get("content"),
             })
             if is_ok and content_hash is not None:
                 check_urls.append(url)
@@ -310,20 +336,40 @@ class IngestDB:
             WHEN EXCLUDED.robots_bits = {ROBOTS_UNKNOWN} THEN {tcur}.robots_bits
             ELSE EXCLUDED.robots_bits
           END
-        RETURNING {", ".join(_HIST_COLS)}, (xmax = 0) AS inserted
+        RETURNING {", ".join(_HIST_COLS + _SELECTDB_MARKER_COLS)}, (xmax = 0) AS inserted
         """
         returned = execute_values(
             cur, upsert_sql, upsert_rows, page_size=len(upsert_rows), fetch=True,
         )
 
         if returned:
-            history_rows = [row[:-1] for row in returned]  # drop trailing 'inserted' flag
+            history_rows = [row[:len(_HIST_COLS)] for row in returned]
             execute_values(
                 cur,
                 f"INSERT INTO {this} ({', '.join(_HIST_COLS)}) VALUES %s",
                 history_rows,
                 page_size=len(history_rows),
             )
+
+        if returned and selectdb_records is not None:
+            decoded_by_url = {d["url"]: d for d in decoded}
+            result_len = len(CRAWL_RESULT_COLUMNS)
+            for row in returned:
+                snapshot = dict(zip(CRAWL_RESULT_COLUMNS, row[:result_len]))
+                if not snapshot.get("is_selectdb_selected"):
+                    continue
+                decoded_row = decoded_by_url.get(snapshot["url"])
+                if decoded_row is None:
+                    continue
+                selectdb_records.append(
+                    SelectDBCrawlRecord(
+                        snapshot=snapshot,
+                        shard_id=shard_id,
+                        status=decoded_row.get("status"),
+                        fetched_at=decoded_row.get("fetched_at_raw"),
+                        content=decoded_row.get("content"),
+                    )
+                )
 
         counter_rows = [
             (d["url"], d["inc_ok"], d["inc_fail"], d["inc_upd"]) for d in decoded
@@ -391,11 +437,22 @@ class IngestDB:
         ]
 
     def _bulk_results(
-        self, cur, shard_id: int, items: list[tuple[int, dict]],
+        self,
+        cur,
+        shard_id: int,
+        items: list[tuple[int, dict]],
+        selectdb_records: list[SelectDBCrawlRecord] | None = None,
     ) -> list[tuple[int, IngestResult]]:
         results: list[tuple[int, IngestResult]] = []
         for sub in self._split_unique_urls(items):
-            results.extend(self._bulk_results_unique(cur, shard_id, sub))
+            results.extend(
+                self._bulk_results_unique(
+                    cur,
+                    shard_id,
+                    sub,
+                    selectdb_records=selectdb_records,
+                )
+            )
         return results
 
     def _bulk_links(
@@ -517,6 +574,7 @@ class IngestDB:
         Returns IngestResult for results, bool for new links, in input order.
         """
         results: list[IngestResult | bool | None] = [None] * len(recs)
+        selectdb_records: list[SelectDBCrawlRecord] = []
 
         results_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
         links_by_shard: dict[int, list[tuple[int, dict]]] = defaultdict(list)
@@ -538,6 +596,23 @@ class IngestDB:
                     for idx, ok in self._bulk_links(cur, sid, items):
                         results[idx] = ok
                 for sid, items in results_by_shard.items():
-                    for idx, ir in self._bulk_results(cur, sid, items):
+                    for idx, ir in self._bulk_results(
+                        cur,
+                        sid,
+                        items,
+                        selectdb_records=selectdb_records,
+                    ):
                         results[idx] = ir
+        if self.selectdb_writer is not None and selectdb_records:
+            try:
+                self.selectdb_writer.upsert_many(selectdb_records)
+            except Exception as exc:
+                logger.error(
+                    "selectdb_results.upsert_error",
+                    extra={
+                        "event": "selectdb_results.upsert_error",
+                        "error": str(exc),
+                        "count": len(selectdb_records),
+                    },
+                )
         return results
